@@ -27,3 +27,11 @@ TabCNN находится в отдельном PP-VKL-GuitarTabs. Следую�
 - Синтаксическая компиляция трёх модулей и тестов прошла.
 - Создан публичный репозиторий LizzBizzLol/GuitarTabsTranscription.
 - GPU-обучение новой архитектуры и полный preprocessing чанка не запускались.
+
+## 2026-10-11 14:52 +05:00 — Публикация
+
+- Инфраструктура и тесты опубликованы в ветке main публичного репозитория
+  https://github.com/LizzBizzLol/GuitarTabsTranscription.
+- Локальный репозиторий D:/GuitarTabsTranscription связан с origin/main.
+- Ошибка TLS в Windows Schannel устранена выбором OpenSSL для команды push;
+  проверка сертификатов не отключалась.
