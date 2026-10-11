@@ -1,7 +1,7 @@
 # GuitarTabsTranscription
 
-Iteration 0: plain PyTorch infrastructure for guitar audio-to-tablature research.
-The repository contains three production Python modules and no model architecture.
+Iterations 0 through 1.2: plain PyTorch infrastructure and single-frame frequency models
+for guitar audio-to-tablature research. No full training experiment has been run.
 The reference implementation is https://github.com/LizzBizzLol/PP-VKL-GuitarTabs.
 
 ## Environment
@@ -91,6 +91,97 @@ whole track. Frame-count/config/audio mismatches fail instead of truncating.
 File identity uses absolute path, size and nanosecond modification time; do not
 modify files while preserving their timestamps. Regenerate after relocating data.
 
+## Frequency U-Net models (iteration 1)
+
+```python
+from models import FullFrequencyUNet, TruncatedFrequencyUNet
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = FullFrequencyUNet().to(device)
+# Alternative: TruncatedFrequencyUNet(pool_bins=8).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+```
+
+Both models take `[B,1,256]` from `GuitarDataset(context_frames=1)` and return
+raw logits `[B,6,26]`, strings 6 to 1. All convolutions operate on frequency;
+multiple time-context frames are rejected, not treated as input channels.
+The common encoder has three Conv1d(3, padding=1)-BatchNorm-ReLU blocks with
+channels 32/64/128 and MaxPool1d(2) after each. Pre-pool skip widths are
+256/128/64, and the final pooled bottleneck width is 32.
+
+The full model upsamples with three ConvTranspose1d(2, stride=2) layers,
+concatenates corresponding skips, and applies Conv-BN-ReLU blocks with
+128/64/32 channels. Flatten produces 8192 features for six separate Linear heads.
+The truncated model has no decoder: AdaptiveAvgPool1d(8) on each skip produces
+1792 concatenated features for its six heads. Pooling to eight positions retains
+coarse frequency location, unlike global averaging. Constructors accept
+`n_mels` (a multiple of eight) and three positive `channels`; `pool_bins` must be
+positive and not exceed the deepest skip width (`n_mels // 4`). Encoder weights
+are independent between model instances. Changing architecture requires a new
+checkpoint directory. Use the `train_model` call below without adapters.
+
+## Additive frequency encoder (iteration 1.1)
+
+```python
+from models import AdditiveFrequencyEncoder
+
+model = AdditiveFrequencyEncoder(n_mels=256).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+```
+
+The input/output contract and training API are unchanged. Conv-BN-ReLU blocks
+use fixed channels 64/128/256, kernel 3 and padding 1. Only the first two blocks
+are followed by MaxPool1d(2). Pooled skips have shapes `[B,64,128]` and
+`[B,128,64]`; the third block produces `[B,256,64]`. The 1x1 projections
+`proj1_to_3` (64 to 256, stride 2) and `proj2_to_3` (128 to 256, stride 1)
+align these skips with the third output. Their elementwise sum is flattened
+without extra pooling and sent to six independent 26-class Linear heads.
+
+Addition has no trainable parameters and retains 256 channels. Concatenating
+the same three projected maps would produce 768 channels: the six heads would
+need 7,667,712 weights instead of 2,555,904, with 156 biases in either case.
+The projections themselves add 49,664 parameters including biases. The complete
+default model has **2,730,140 parameters**, more than either earlier U-Net;
+addition is cheaper than matched-map concatenation, not necessarily cheaper than
+a different architecture. Use a separate checkpoint directory for this model.
+`n_mels` must be a positive multiple of four. As with ordinary BatchNorm,
+training needs more than one value per channel: the smallest `n_mels=4` requires
+batch size greater than one, though batch-one inference works in eval mode.
+
+## Sequential baseline (iteration 1.2)
+
+```python
+from models import TabCNNBaseline
+
+model = TabCNNBaseline(n_mels=256).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+```
+
+This is the specified **1D Log-Mel baseline**, not an exact reproduction of the
+original TabCNN. It has no skip connections, projections or branch merging.
+The first two blocks are Conv1d(3, padding=1)-BatchNorm-ReLU-Dropout(0.25),
+with channels 32 then 64 and unchanged frequency width. The third block is
+Conv1d(64,128,3,padding=1)-MaxPool1d(2)-BatchNorm-ReLU-Dropout(0.25), in that
+order. Flatten of `[B,128,128]` gives 16384 features for six independent heads.
+`n_mels` must be positive and even; at the minimum width of two, training needs
+batch size greater than one for BatchNorm. Dropout is disabled in eval mode.
+
+All four models have the same `forward(x)` contract and work directly with
+`GuitarDataset(context_frames=1)`, `GuitarTabLoss` and `train_model`.
+Defaults, including all trainable weights and biases:
+
+| Model | Input | Raw logits | Parameters |
+| --- | --- | --- | ---: |
+| FullFrequencyUNet | `[B,1,256]` | `[B,6,26]` | 1,492,764 |
+| TruncatedFrequencyUNet | `[B,1,256]` | `[B,6,26]` | 311,196 |
+| AdditiveFrequencyEncoder | `[B,1,256]` | `[B,6,26]` | 2,730,140 |
+| TabCNNBaseline | `[B,1,256]` | `[B,6,26]` | 2,587,548 |
+
+Exact CPU mid-epoch resume is tested for all four default architectures with
+Adam, including Dropout RNG and BatchNorm buffers. Each architecture needs its
+own checkpoint directory. These smoke tests are not real-data quality benchmarks.
+
 ## Loss and training
 
 Supply an ordinary torch.nn.Module returning **raw logits `[B,6,26]`**;
@@ -144,6 +235,35 @@ run directory for a different model/data setup. Exact CPU resume is verified;
 GPU operations may be nondeterministic, and bitwise equivalence across devices
 or library versions is not promised. Use trusted `.pt` files only (weights-only
 loading is enabled).
+
+## Inspecting a frame and feature maps
+
+```python
+from visualizer import plot_spectrogram_frame, extract_feature_maps, plot_feature_maps
+
+frame, targets = train_dataset[0]  # [1,256], [6]
+fig, ax = plot_spectrogram_frame(frame)
+fig.savefig("D:/DATA/GuitarTabsTranscription/input_frame.png", dpi=150)
+maps = extract_feature_maps(model, frame.unsqueeze(0).to(device))
+fig, axes = plot_feature_maps(maps, sample_index=0)
+fig.savefig("D:/DATA/GuitarTabsTranscription/feature_maps.png", dpi=150)
+```
+
+Functions do not call `show` or save automatically. Close returned figures with
+`matplotlib.pyplot.close(fig)` when done; for headless execution select Matplotlib
+`Agg` before importing the visualizer. Default hooks capture `encoder.0` and
+`encoder.2` after ReLU: `[B,32,256]` and `[B,128,64]` for the U-Nets;
+`[B,64,256]` and `[B,256,64]` for AdditiveFrequencyEncoder. The additive model
+has no pooling after its third block.
+For TabCNNBaseline the corresponding maps are `[B,32,256]` and `[B,128,128]`;
+hooks see the complete blocks, including Dropout (disabled during extraction).
+Pass distinct names from `model.named_modules()` via `layer_names` to inspect
+other tensor-valued `[B,C,F]` layers. The input must already match the model device.
+Extraction uses eval/no-grad, removes hooks even on failure, restores each
+module's prior mode and returns independent CPU copies. Each heatmap has its own
+activation scale; the horizontal axis is feature-map position, not physical Hz.
+Random weights do not establish tonic or overtone detectors. Such interpretation
+requires trained weights and comparison against annotated audio.
 
 ## Verification
 
